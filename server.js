@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const axios   = require("axios");
 const cheerio = require("cheerio");
 const cron    = require("node-cron");
@@ -64,9 +64,6 @@ async function scrapeAiScorePage(sport) {
       "li[class*='match']",
       "div[class*='match-item']",
       "div[class*='event-row']"
-     "[class*='match-item']",
-      "[class*='event-item']",
-      "div[data-id]",            
     ];
 
     let found = false;
@@ -525,4 +522,4 @@ cron.schedule("*/5 * * * *", refreshOdds);
 
 app.listen(PORT, () => {
   console.log(`BallIQ backend running on port ${PORT}`);
-});    
+});
