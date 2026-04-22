@@ -38,7 +38,7 @@ const AI_HEADERS = {
 
 const AI_SPORT_PATHS = {
   basketball : "basketball",
-  football   : "",
+  football   : "football",
   tennis     : "tennis",
   baseball   : "baseball",
   hockey     : "ice-hockey"
