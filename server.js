@@ -38,7 +38,7 @@ const AI_HEADERS = {
 
 const AI_SPORT_PATHS = {
   basketball : "basketball",
-  football   : "football",
+  football   : "",
   tennis     : "tennis",
   baseball   : "baseball",
   hockey     : "ice-hockey"
@@ -64,6 +64,9 @@ async function scrapeAiScorePage(sport) {
       "li[class*='match']",
       "div[class*='match-item']",
       "div[class*='event-row']"
+     "[class*='match-item']",
+      "[class*='event-item']",
+      "div[data-id]",            
     ];
 
     let found = false;
