@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: balliq-backend
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: ODDS_KEY
+        value: 07dd34f3881dacd8b47b80bd58051a24
