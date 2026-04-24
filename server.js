@@ -8,42 +8,33 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
-// ── API Keys ───────────────────────────────────────────────────────────────
-const ODDS_KEY = process.env.ODDS_KEY || "d798eaddfb18067ac60181fee84d9f9a";
+// ── Keys ───────────────────────────────────────────────────────────────────
+const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || "";
 
-// ── In-memory cache ────────────────────────────────────────────────────────
+// ── Cache ──────────────────────────────────────────────────────────────────
 let cache = {
-  basketball : [],
-  football   : [],
-  baseball   : [],
-  hockey     : [],
-  all        : [],
-  lastUpdated: null
-};
-
-// Separate store for odds data (refreshed every 5 min)
-let oddsStore = {
-  basketball: [], football: [], baseball: [], hockey: []
+  basketball: [], football: [], baseball: [],
+  hockey: [], tennis: [], all: [], lastUpdated: null
 };
 
 // ══════════════════════════════════════════════════════════════════
-//  ESPN PUBLIC APIs  (no key needed, clean JSON, refreshes every 60s)
+//  ESPN  (primary — clean JSON, no key)
 // ══════════════════════════════════════════════════════════════════
 
 const ESPN_ENDPOINTS = {
   basketball: [
-    { url: "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",   league: "NBA" },
-    { url: "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",  league: "WNBA" },
+    { url: "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",  league: "NBA" },
+    { url: "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard", league: "WNBA" },
     { url: "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard", league: "NCAA" }
   ],
   football: [
-    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",                league: "Premier League" },
-    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard",                league: "La Liga" },
-    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/ger.1/scoreboard",                league: "Bundesliga" },
-    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/ita.1/scoreboard",                league: "Serie A" },
-    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/fra.1/scoreboard",                league: "Ligue 1" },
+    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",                 league: "Premier League" },
+    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard",                 league: "La Liga" },
+    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/ger.1/scoreboard",                 league: "Bundesliga" },
+    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/ita.1/scoreboard",                 league: "Serie A" },
+    { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/fra.1/scoreboard",                 league: "Ligue 1" },
     { url: "https://site.api.espn.com/apis/site/v2/sports/soccer/UEFA.Champions_League/scoreboard", league: "Champions League" }
   ],
   baseball: [
@@ -51,35 +42,34 @@ const ESPN_ENDPOINTS = {
   ],
   hockey: [
     { url: "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard", league: "NHL" }
+  ],
+  tennis: [
+    { url: "https://site.api.espn.com/apis/site/v2/sports/tennis/scoreboard", league: "ATP/WTA" }
   ]
 };
 
 const ESPN_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (compatible; BallIQ/1.0)",
+  "User-Agent": "Mozilla/5.0 (compatible; BallIQ/2.0)",
   "Accept"    : "application/json"
 };
 
 async function fetchESPNSport(sport) {
   const endpoints = ESPN_ENDPOINTS[sport] || [];
-  let allMatches  = [];
-
+  let all = [];
   for (const ep of endpoints) {
     try {
-      const resp = await axios.get(ep.url, {
-        headers: ESPN_HEADERS,
-        timeout: 10000
-      });
-      const matches = parseESPNScoreboard(resp.data, sport, ep.league);
-      allMatches    = allMatches.concat(matches);
+      const resp    = await axios.get(ep.url, { headers: ESPN_HEADERS, timeout: 10000 });
+      const matches = parseESPN(resp.data, sport, ep.league);
+      all           = all.concat(matches);
       console.log(`ESPN ${ep.league}: ${matches.length} matches`);
     } catch (err) {
-      console.log(`ESPN failed for ${ep.league}: ${err.message}`);
+      console.log(`ESPN ${ep.league} failed: ${err.message}`);
     }
   }
-  return allMatches;
+  return all;
 }
 
-function parseESPNScoreboard(data, sport, league) {
+function parseESPN(data, sport, league) {
   const matches = [];
   const events  = data?.events || [];
 
@@ -87,337 +77,321 @@ function parseESPNScoreboard(data, sport, league) {
     try {
       const comp        = ev.competitions?.[0];
       if (!comp) continue;
-
       const competitors = comp.competitors || [];
       if (competitors.length < 2) continue;
 
-      // ESPN always puts home team first when homeAway = "home"
-      const homeComp = competitors.find(c => c.homeAway === "home") || competitors[0];
-      const awayComp = competitors.find(c => c.homeAway === "away") || competitors[1];
+      const homeC = competitors.find(c => c.homeAway === "home") || competitors[0];
+      const awayC = competitors.find(c => c.homeAway === "away") || competitors[1];
 
-      const homeTeam  = homeComp.team?.displayName || homeComp.team?.name || "Home";
-      const awayTeam  = awayComp.team?.displayName || awayComp.team?.name || "Away";
-      const homeScore = parseInt(homeComp.score || "0");
-      const awayScore = parseInt(awayComp.score || "0");
-
-      // Status
       const status    = ev.status || {};
-      const stateType = status.type?.state || "pre";   // pre, in, post
-      const isLive    = stateType === "in";
-      const isFinished = stateType === "post";
+      const stateType = status.type?.state || "pre";
+      if (stateType === "post") continue; // skip finished
 
-      // Skip finished games
-      if (isFinished) continue;
+      // Quarter-by-quarter scores
+      const homeQScores = (homeC.linescores || []).map(s => parseInt(s.value || 0));
+      const awayQScores = (awayC.linescores || []).map(s => parseInt(s.value || 0));
 
-      // Period / quarter info
-      const period    = status.period || 1;
-      const clockStr  = status.displayClock || "0:00";
-      const quarter   = espnPeriodToQuarter(sport, period, stateType);
-      const minute    = parseClockToElapsed(clockStr, sport);
+      // Team stats if available
+      const homeStats = extractESPNStats(homeC);
+      const awayStats = extractESPNStats(awayC);
 
-      // Odds from ESPN (sometimes included)
-      let homeOdds = 1.91, awayOdds = 1.91;
-      const odds = comp.odds?.[0];
-      if (odds) {
-        // ESPN provides spread, convert to approximate moneyline
-        const spread = parseFloat(odds.spread || "0");
-        if (!isNaN(spread) && spread !== 0) {
-          // Rough conversion: spread to implied win probability
-          homeOdds = spreadToDecimalOdds(spread);
-          awayOdds = spreadToDecimalOdds(-spread);
-        }
-      }
+      // Injuries
+      const injuries = extractInjuries(comp);
 
       matches.push({
-        id             : ev.id || `espn_${sport}_${matches.length}`,
-        homeTeam,
-        awayTeam,
-        homeScore,
-        awayScore,
-        quarter,
-        minuteInQuarter: minute,
-        homeOdds,
-        awayOdds,
-        totalLine      : 0,
-        overOdds       : 1.91,
-        underOdds      : 1.91,
+        id              : ev.id || `espn_${matches.length}`,
+        homeTeam        : homeC.team?.displayName || "Home",
+        awayTeam        : awayC.team?.displayName || "Away",
+        homeScore       : parseInt(homeC.score || "0"),
+        awayScore       : parseInt(awayC.score || "0"),
+        homeQScores,
+        awayQScores,
+        quarter         : espnPeriod(sport, status.period || 1, stateType, status.displayClock),
+        minuteInQuarter : parseClockElapsed(status.displayClock || "12:00"),
+        homeOdds        : 1.91,
+        awayOdds        : 1.91,
+        totalLine       : 0,
+        overOdds        : 1.91,
+        underOdds       : 1.91,
         league,
         sport,
-        isLive,
-        source         : "ESPN"
+        isLive          : stateType === "in",
+        source          : "ESPN",
+        homeStats,
+        awayStats,
+        injuries,
+        commenceTime    : ev.date || ""
       });
-    } catch (e) {
-      // skip bad event
-    }
+    } catch (e) { /* skip */ }
   }
   return matches;
 }
 
-function espnPeriodToQuarter(sport, period, state) {
-  if (state === "pre") return "—";
-  if (sport === "football") {
-    // Soccer uses minutes
-    return state === "in" ? "LIVE" : "FT";
+function extractESPNStats(competitor) {
+  const stats = {};
+  const raw   = competitor.statistics || [];
+  for (const s of raw) {
+    stats[s.name] = s.displayValue || s.value;
   }
-  if (sport === "baseball") {
-    return `Inn ${period}`;
-  }
-  // Basketball and hockey use periods/quarters
-  const map = { 1: "Q1", 2: "Q2", 3: "Q3", 4: "Q4" };
-  return map[period] || (period > 4 ? "OT" : "Q" + period);
+  return stats;
 }
 
-function parseClockToElapsed(clockStr, sport) {
-  // clockStr is time remaining e.g. "7:34"
+function extractInjuries(comp) {
+  const list = [];
+  const geo  = comp.geoBroadcasts || [];
+  // ESPN sometimes includes injuries in notes
+  const notes = comp.notes || [];
+  for (const n of notes) {
+    if (n.text && n.text.toLowerCase().includes("out")) {
+      list.push(n.text);
+    }
+  }
+  return list;
+}
+
+function espnPeriod(sport, period, state, clock) {
+  if (state === "pre") return "PRE";
+  if (sport === "football") return state === "in" ? (clock || "LIVE") : "FT";
+  if (sport === "baseball") return `Inn ${period}`;
+  if (sport === "tennis")   return `Set ${period}`;
+  const map = { 1:"Q1", 2:"Q2", 3:"Q3", 4:"Q4" };
+  return map[period] || (period > 4 ? "OT" : `Q${period}`);
+}
+
+function parseClockElapsed(clockStr) {
   try {
-    const parts = clockStr.split(":");
-    const minRemaining = parseInt(parts[0]);
-    return Math.max(0, 12 - minRemaining); // convert remaining to elapsed
+    const parts = (clockStr || "12:00").split(":");
+    return Math.max(0, 12 - parseInt(parts[0]));
   } catch (e) { return 6; }
 }
 
-function spreadToDecimalOdds(spread) {
-  // Approximate: every 3 points of spread ≈ 10% win probability shift from 50%
-  const prob = Math.min(0.90, Math.max(0.10, 0.5 + (spread * -1) * 0.033));
-  return parseFloat((1 / prob).toFixed(2));
-}
-
 // ══════════════════════════════════════════════════════════════════
-//  THE ODDS API  (new key, refreshes every 5 minutes)
+//  SOFASCORE  (secondary — enriches stats, no key)
 // ══════════════════════════════════════════════════════════════════
 
-const ODDS_SPORTS = {
-  basketball : ["basketball_nba", "basketball_euroleague"],
-  football   : [
-    "soccer_epl",
-    "soccer_spain_la_liga",
-    "soccer_italy_serie_a",
-    "soccer_germany_bundesliga",
-    "soccer_france_ligue_one"
-  ],
-  baseball   : ["baseball_mlb"],
-  hockey     : ["icehockey_nhl"]
+const SOFA_SPORTS = {
+  basketball: "basketball",
+  football  : "football",
+  baseball  : "baseball",
+  hockey    : "ice-hockey",
+  tennis    : "tennis"
 };
 
-async function fetchOddsForSport(sport) {
-  const sportKeys = ODDS_SPORTS[sport] || [];
-  let allMatches  = [];
+const SOFA_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Linux; Android 12; Mobile) AppleWebKit/537.36",
+  "Accept"    : "application/json",
+  "Referer"   : "https://www.sofascore.com/"
+};
 
-  for (const key of sportKeys) {
-    try {
-      await sleep(1200); // avoid burst rate limit
-
-      const [oddsResp, scoresResp] = await Promise.all([
-        axios.get(`https://api.the-odds-api.com/v4/sports/${key}/odds/`, {
-          params : { apiKey: ODDS_KEY, regions: "eu", markets: "h2h,totals", oddsFormat: "decimal" },
-          timeout: 12000
-        }),
-        axios.get(`https://api.the-odds-api.com/v4/sports/${key}/scores/`, {
-          params : { apiKey: ODDS_KEY, daysFrom: 1 },
-          timeout: 12000
-        }).catch(() => ({ data: [] }))
-      ]);
-
-      const remaining = oddsResp.headers["x-requests-remaining"];
-      console.log(`Odds API ${key}: ${oddsResp.data.length} matches | Quota left: ${remaining}`);
-
-      const scoreMap = buildScoreMap(scoresResp.data);
-      const matches  = parseOddsResponse(oddsResp.data, key, sport, scoreMap);
-      allMatches     = allMatches.concat(matches);
-
-    } catch (err) {
-      if (err.response?.status === 429) {
-        console.log(`429 on ${key} — stopping to protect quota`);
-        break;
-      }
-      console.log(`Odds API error for ${key}: ${err.message}`);
-    }
+async function fetchSofaLive(sport) {
+  const sportName = SOFA_SPORTS[sport] || "basketball";
+  try {
+    const resp = await axios.get(
+      `https://api.sofascore.com/api/v1/sport/${sportName}/events/live`,
+      { headers: SOFA_HEADERS, timeout: 10000 }
+    );
+    return parseSofaScore(resp.data, sport);
+  } catch (err) {
+    console.log(`SofaScore ${sport} failed: ${err.message}`);
+    return [];
   }
-  return allMatches;
 }
 
-function buildScoreMap(scoresArr) {
-  const map = {};
-  if (!Array.isArray(scoresArr)) return map;
-
-  for (const g of scoresArr) {
-    const home  = g.home_team || "";
-    const away  = g.away_team || "";
-    const key   = norm(home) + "|" + norm(away);
-    const scArr = g.scores || [];
-    let hs = 0, as = 0;
-
-    for (const s of scArr) {
-      const sc = parseInt(s.score || "0");
-      if (s.name === home) hs = sc;
-      else as = sc;
-    }
-
-    map[key] = {
-      homeScore : hs,
-      awayScore : as,
-      isLive    : !g.completed,
-      quarter   : estimateQuarter(hs + as)
-    };
-  }
-  return map;
-}
-
-function parseOddsResponse(arr, leagueKey, sport, scoreMap) {
-  if (!Array.isArray(arr)) return [];
+function parseSofaScore(data, sport) {
   const matches = [];
+  const events  = data?.events || [];
 
-  for (const g of arr) {
+  for (const ev of events) {
     try {
-      const home = g.home_team || "";
-      const away = g.away_team || "";
-      const si   = scoreMap[norm(home) + "|" + norm(away)]
-                || fuzzyScore(home, away, scoreMap)
-                || { homeScore: 0, awayScore: 0, isLive: false, quarter: "—" };
+      const hs = ev.homeScore || {};
+      const as = ev.awayScore || {};
+      const st = ev.status   || {};
 
-      const m = {
-        id             : g.id || Math.random().toString(36).slice(2),
-        homeTeam       : home,
-        awayTeam       : away,
-        homeScore      : si.homeScore,
-        awayScore      : si.awayScore,
-        quarter        : si.quarter,
+      const homeQScores = [hs.period1||0, hs.period2||0, hs.period3||0, hs.period4||0].filter((v,i) => i < (st.currentPeriodStartTimestamp ? 4 : 2));
+      const awayQScores = [as.period1||0, as.period2||0, as.period3||0, as.period4||0].filter((v,i) => i < homeQScores.length);
+
+      matches.push({
+        id             : `sofa_${ev.id || matches.length}`,
+        homeTeam       : ev.homeTeam?.name || "",
+        awayTeam       : ev.awayTeam?.name || "",
+        homeScore      : hs.current || 0,
+        awayScore      : as.current || 0,
+        homeQScores,
+        awayQScores,
+        quarter        : sofaStatus(sport, st),
         minuteInQuarter: 6,
         homeOdds       : 1.91,
         awayOdds       : 1.91,
         totalLine      : 0,
         overOdds       : 1.91,
         underOdds      : 1.91,
-        league         : leagueToName(leagueKey),
+        league         : ev.tournament?.name || sport,
         sport,
-        isLive         : si.isLive,
-        source         : "TheOddsAPI",
-        commenceTime   : g.commence_time || ""
-      };
-
-      for (const book of (g.bookmakers || [])) {
-        for (const mkt of (book.markets || [])) {
-          if (mkt.key === "h2h") {
-            for (const o of (mkt.outcomes || [])) {
-              if (o.name === home)      m.homeOdds = o.price;
-              else if (o.name === away) m.awayOdds = o.price;
-            }
-          } else if (mkt.key === "totals") {
-            for (const o of (mkt.outcomes || [])) {
-              if (o.name === "Over")  { m.overOdds = o.price; m.totalLine = o.point || m.totalLine; }
-              if (o.name === "Under") { m.underOdds = o.price; if (!m.totalLine) m.totalLine = o.point; }
-            }
-          }
-        }
-        break; // first bookmaker only
-      }
-
-      if (m.homeOdds > 1.0 && m.awayOdds > 1.0) matches.push(m);
+        isLive         : st.type === "inprogress",
+        source         : "SofaScore",
+        homeStats      : {},
+        awayStats      : {},
+        injuries       : []
+      });
     } catch (e) { /* skip */ }
   }
   return matches;
 }
 
+function sofaStatus(sport, st) {
+  const desc = (st.description || "").toLowerCase();
+  if (desc.includes("1st") || desc.includes("q1")) return "Q1";
+  if (desc.includes("2nd") || desc.includes("q2")) return "Q2";
+  if (desc.includes("half"))                        return "HT";
+  if (desc.includes("3rd") || desc.includes("q3")) return "Q3";
+  if (desc.includes("4th") || desc.includes("q4")) return "Q4";
+  if (desc.includes("overtime"))                    return "OT";
+  if (st.type === "inprogress")                     return "LIVE";
+  return "—";
+}
+
 // ══════════════════════════════════════════════════════════════════
-//  MERGE  (ESPN scores + Odds API odds → one rich match object)
+//  CLAUDE VISION — extract odds from screenshot
 // ══════════════════════════════════════════════════════════════════
 
-function mergeESPNWithOdds(espnMatches, oddsMatches) {
+app.post("/api/analyze-screenshot", async (req, res) => {
+  const { imageBase64, mediaType, sport, feedStage } = req.body;
+
+  if (!imageBase64) {
+    return res.status(400).json({ error: "No image provided" });
+  }
+
+  if (!ANTHROPIC_KEY) {
+    return res.status(500).json({ error: "ANTHROPIC_KEY not configured on server" });
+  }
+
+  try {
+    const response = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      {
+        model     : "claude-sonnet-4-20250514",
+        max_tokens: 512,
+        messages  : [{
+          role   : "user",
+          content: [
+            {
+              type  : "image",
+              source: { type: "base64", media_type: mediaType || "image/jpeg", data: imageBase64 }
+            },
+            {
+              type: "text",
+              text: `You are a sports betting odds extractor. Look at this screenshot and extract all betting odds visible.
+Return ONLY a valid JSON object with these fields (use null if not visible):
+{
+  "homeOdds": number,
+  "awayOdds": number,
+  "drawOdds": number,
+  "totalLine": number,
+  "overOdds": number,
+  "underOdds": number,
+  "homeSpread": number,
+  "awaySpread": number,
+  "homeSpreadOdds": number,
+  "awaySpreadOdds": number,
+  "htHomeOdds": number,
+  "htAwayOdds": number,
+  "htDrawOdds": number,
+  "bookmaker": string
+}
+All odds should be decimal format. No explanation, only JSON.`
+            }
+          ]
+        }]
+      },
+      {
+        headers: {
+          "x-api-key"        : ANTHROPIC_KEY,
+          "anthropic-version": "2023-06-01",
+          "Content-Type"     : "application/json"
+        },
+        timeout: 20000
+      }
+    );
+
+    const text  = response.data.content?.[0]?.text || "{}";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const odds  = JSON.parse(clean);
+
+    res.json({ success: true, odds, feedStage: feedStage || "LIVE" });
+  } catch (err) {
+    console.error("Claude Vision error:", err.message);
+    res.status(500).json({ error: "Failed to analyze screenshot: " + err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════
+//  MERGE  (ESPN primary + SofaScore enrichment)
+// ══════════════════════════════════════════════════════════════════
+
+function mergeData(espnMatches, sofaMatches) {
   const result = [...espnMatches];
 
-  for (const espn of result) {
-    // Find matching odds entry by team name fuzzy match
-    const oddsMatch = oddsMatches.find(o =>
-      norm(o.homeTeam).includes(lastWord(espn.homeTeam)) &&
-      norm(o.awayTeam).includes(lastWord(espn.awayTeam))
+  for (const sofa of sofaMatches) {
+    const exists = result.find(e =>
+      norm(e.homeTeam).includes(lastWord(sofa.homeTeam)) &&
+      norm(e.awayTeam).includes(lastWord(sofa.awayTeam))
     );
-    if (oddsMatch) {
-      // Enrich ESPN entry with real odds
-      espn.homeOdds  = oddsMatch.homeOdds;
-      espn.awayOdds  = oddsMatch.awayOdds;
-      espn.totalLine = oddsMatch.totalLine;
-      espn.overOdds  = oddsMatch.overOdds;
-      espn.underOdds = oddsMatch.underOdds;
+    if (exists) {
+      // Enrich ESPN entry with SofaScore quarter scores if richer
+      if (sofa.homeQScores.length > (exists.homeQScores || []).length) {
+        exists.homeQScores = sofa.homeQScores;
+        exists.awayQScores = sofa.awayQScores;
+      }
+      if (sofa.homeScore > 0 && exists.homeScore === 0) {
+        exists.homeScore = sofa.homeScore;
+        exists.awayScore = sofa.awayScore;
+      }
+    } else {
+      result.push(sofa);
     }
   }
-
-  // Add odds-only matches (upcoming games not on ESPN scoreboard yet)
-  for (const odds of oddsMatches) {
-    const alreadyIn = result.find(e =>
-      norm(e.homeTeam).includes(lastWord(odds.homeTeam)) &&
-      norm(e.awayTeam).includes(lastWord(odds.awayTeam))
-    );
-    if (!alreadyIn) result.push(odds);
-  }
-
   return result;
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  REFRESH FUNCTIONS
+//  REFRESH
 // ══════════════════════════════════════════════════════════════════
 
-async function refreshESPN() {
-  console.log(`[${new Date().toISOString()}] Refreshing ESPN scores…`);
-  const sports = ["basketball", "football", "baseball", "hockey"];
+async function refreshAll() {
+  console.log(`[${new Date().toISOString()}] Refreshing…`);
+  const sports = ["basketball","football","baseball","hockey","tennis"];
 
   await Promise.all(sports.map(async (sport) => {
     try {
-      const espnMatches = await fetchESPNSport(sport);
-      cache[sport]      = mergeESPNWithOdds(espnMatches, oddsStore[sport]);
+      const [espn, sofa] = await Promise.all([
+        fetchESPNSport(sport),
+        fetchSofaLive(sport)
+      ]);
+      cache[sport] = mergeData(espn, sofa);
     } catch (err) {
-      console.error(`ESPN refresh error for ${sport}: ${err.message}`);
+      console.error(`Refresh error ${sport}: ${err.message}`);
     }
   }));
 
-  rebuildAll();
-}
-
-async function refreshOdds() {
-  console.log(`[${new Date().toISOString()}] Refreshing Odds API…`);
-  const sports = ["basketball", "football", "baseball", "hockey"];
-
-  for (const sport of sports) {
-    try {
-      const matches     = await fetchOddsForSport(sport);
-      oddsStore[sport]  = matches;
-      // Re-merge with latest ESPN data
-      const espnMatches = cache[sport].filter(m => m.source === "ESPN");
-      cache[sport]      = mergeESPNWithOdds(espnMatches, matches);
-    } catch (err) {
-      console.error(`Odds refresh error for ${sport}: ${err.message}`);
-    }
-    await sleep(2000);
-  }
-
-  rebuildAll();
-}
-
-function rebuildAll() {
   cache.all = [
-    ...cache.basketball,
-    ...cache.football,
-    ...cache.baseball,
-    ...cache.hockey
+    ...cache.basketball, ...cache.football, ...cache.baseball,
+    ...cache.hockey,     ...cache.tennis
   ];
   cache.lastUpdated = new Date().toISOString();
-  console.log(`✅ Cache updated. Total: ${cache.all.length} matches`);
+  console.log(`✅ Total cached: ${cache.all.length}`);
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  API ROUTES
+//  ROUTES
 // ══════════════════════════════════════════════════════════════════
 
 app.get("/api/health", (req, res) => {
   res.json({
-    status     : "ok",
-    lastUpdated: cache.lastUpdated,
-    counts     : {
-      all        : cache.all.length,
-      basketball : cache.basketball.length,
-      football   : cache.football.length,
-      baseball   : cache.baseball.length,
-      hockey     : cache.hockey.length
+    status: "ok", lastUpdated: cache.lastUpdated,
+    counts: {
+      all: cache.all.length, basketball: cache.basketball.length,
+      football: cache.football.length, baseball: cache.baseball.length,
+      hockey: cache.hockey.length, tennis: cache.tennis.length
     }
   });
 });
@@ -433,7 +407,7 @@ app.get("/api/matches/all", (req, res) => {
 });
 
 app.post("/api/refresh", async (req, res) => {
-  await Promise.all([refreshESPN(), refreshOdds()]);
+  await refreshAll();
   res.json({ status: "refreshed", count: cache.all.length });
 });
 
@@ -441,44 +415,8 @@ app.post("/api/refresh", async (req, res) => {
 //  HELPERS
 // ══════════════════════════════════════════════════════════════════
 
-function estimateQuarter(totalPts) {
-  if (totalPts < 55)  return "Q1";
-  if (totalPts < 115) return "Q2";
-  if (totalPts < 170) return "Q3";
-  return "Q4";
-}
-
-function norm(s)     { return (s || "").toLowerCase().trim(); }
-
-function lastWord(s) {
-  if (!s) return "";
-  return s.trim().split(/\s+/).pop().toLowerCase();
-}
-
-function fuzzyScore(home, away, map) {
-  const hW = lastWord(home), aW = lastWord(away);
-  for (const [k, v] of Object.entries(map)) {
-    if (k.includes(hW) && k.includes(aW)) return v;
-  }
-  return null;
-}
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function leagueToName(key) {
-  const map = {
-    basketball_nba            : "NBA",
-    basketball_euroleague     : "EuroLeague",
-    soccer_epl                : "Premier League",
-    soccer_spain_la_liga      : "La Liga",
-    soccer_italy_serie_a      : "Serie A",
-    soccer_germany_bundesliga : "Bundesliga",
-    soccer_france_ligue_one   : "Ligue 1",
-    baseball_mlb              : "MLB",
-    icehockey_nhl             : "NHL"
-  };
-  return map[key] || key;
-}
+function norm(s)     { return (s||"").toLowerCase().trim(); }
+function lastWord(s) { return (s||"").trim().split(/\s+/).pop().toLowerCase(); }
 
 // ══════════════════════════════════════════════════════════════════
 //  KEEP-ALIVE
@@ -486,32 +424,15 @@ function leagueToName(key) {
 
 setInterval(() => {
   const url = process.env.RENDER_EXTERNAL_URL;
-  if (url) {
-    https.get(url + "/api/health", (res) => {
-      console.log(`Keep-alive: ${res.statusCode}`);
-    }).on("error", () => {});
-  }
+  if (url) https.get(url + "/api/health", () => {}).on("error", () => {});
 }, 14 * 60 * 1000);
-
-// ══════════════════════════════════════════════════════════════════
-//  CRON SCHEDULES
-// ══════════════════════════════════════════════════════════════════
-
-// ESPN live scores — every 60 seconds, completely free
-cron.schedule("* * * * *", refreshESPN);
-
-// Odds API — every 5 minutes to protect quota
-cron.schedule("*/5 * * * *", refreshOdds);
 
 // ══════════════════════════════════════════════════════════════════
 //  STARTUP
 // ══════════════════════════════════════════════════════════════════
 
-(async () => {
-  await refreshOdds();  // odds first
-  await refreshESPN();  // then live scores
-})();
+cron.schedule("* * * * *", refreshAll);
 
-app.listen(PORT, () => {
-  console.log(`BallIQ backend running on port ${PORT}`);
-});
+refreshAll();
+
+app.listen(PORT, () => console.log(`BallIQ v2 backend on port ${PORT}`));
